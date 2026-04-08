@@ -205,3 +205,13 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# VS Code settings and Claude
+.vscode/
+.claude/
+
+# Project runtime directories
+data/
+artifacts/
+results/
+
