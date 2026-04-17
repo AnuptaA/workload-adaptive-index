@@ -1,19 +1,22 @@
 .PHONY: install download benchmark label hello test clean all
 
+PYTHON_BIN ?= python3
+PYTHON := PYTHONPATH=$(CURDIR) $(PYTHON_BIN)
+
 install:
 	pip install -r requirements.txt
 
 download:
-	python scripts/download_datasets.py --data-dir data/
+	$(PYTHON) scripts/download_datasets.py --data-dir data/
 
 benchmark:
-	python scripts/run_benchmark.py --data-dir data/ --results-dir results/
+	$(PYTHON) scripts/run_benchmark.py --data-dir data/ --results-dir results/
 
 label:
-	python scripts/label_data.py --results-dir results/
+	$(PYTHON) scripts/label_data.py --results-dir results/
 
 hello:
-	python scripts/hello_world.py
+	$(PYTHON) scripts/hello_world.py
 
 test:
 	pytest tests/ -v
