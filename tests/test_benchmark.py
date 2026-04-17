@@ -3,7 +3,6 @@ import pytest
 
 from src.benchmark import benchmark_single, query_index
 from src.index_builder import build_index
-from src.utils import compute_recall_at_k
 
 @pytest.fixture
 def small_index():
@@ -41,19 +40,45 @@ class TestQueryIndex:
         assert p99_lat >= mean_lat
 
 class TestComputeRecallAtKViaQueryIndex:
-    def test_self_search_high_recall(self, small_index):
-        """Searching train vectors against themselves should yield near-perfect recall."""
+    def test_self_search_shape(self, small_index):
         index, train = small_index
         k = 10
         retrieved, _, _ = query_index(index, train[:50], k)
-        gt = np.tile(np.arange(len(train)), (50, 1))
-        # Use compute_recall_at_k with train indices as approximate ground truth
         assert retrieved.shape == (50, k)
 
 class TestBenchmarkSingle:
-    def test_raises_not_implemented(self):
-        rng = np.random.default_rng(0)
-        vecs = rng.random((100, 16)).astype(np.float32)
-        gt = np.zeros((10, 10), dtype=np.int32)
-        with pytest.raises(NotImplementedError):
-            benchmark_single("HNSW", vecs, vecs[:10], gt, k=5)
+    def test_returns_expected_keys(self, small_index, small_queries):
+        index, train = small_index
+        gt = np.tile(np.arange(len(train)), (len(small_queries), 1)).astype(np.int32)
+        result = benchmark_single(index, small_queries, gt, k=5)
+        assert set(result.keys()) == {"k", "mean_latency_ms", "p99_latency_ms", "recall_at_k"}
+
+    def test_k_value_stored(self, small_index, small_queries):
+        index, train = small_index
+        gt = np.tile(np.arange(len(train)), (len(small_queries), 1)).astype(np.int32)
+        result = benchmark_single(index, small_queries, gt, k=7)
+        assert result["k"] == 7
+
+    def test_recall_in_range(self, small_index, small_queries):
+        index, train = small_index
+        gt = np.tile(np.arange(len(train)), (len(small_queries), 1)).astype(np.int32)
+        result = benchmark_single(index, small_queries, gt, k=5)
+        assert 0.0 <= result["recall_at_k"] <= 1.0
+
+    def test_latencies_positive(self, small_index, small_queries):
+        index, train = small_index
+        gt = np.tile(np.arange(len(train)), (len(small_queries), 1)).astype(np.int32)
+        result = benchmark_single(index, small_queries, gt, k=5)
+        assert result["mean_latency_ms"] > 0
+        assert result["p99_latency_ms"] > 0
+
+    def test_perfect_recall_on_train_vectors(self):
+        """Searching train vectors against a flat L2 index should give recall=1.0."""
+        import faiss as _faiss
+        rng = np.random.default_rng(42)
+        vecs = rng.random((200, 16)).astype(np.float32)
+        flat = _faiss.IndexFlatL2(16)
+        flat.add(vecs)
+        gt = np.tile(np.arange(len(vecs)), (len(vecs), 1)).astype(np.int32)
+        result = benchmark_single(flat, vecs, gt, k=1)
+        assert result["recall_at_k"] == pytest.approx(1.0)
