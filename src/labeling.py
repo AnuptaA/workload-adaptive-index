@@ -3,6 +3,8 @@ import pandas as pd
 
 from src.config import MEMORY_VIOLATION_WEIGHT, RANDOM_SEED, RECALL_VIOLATION_WEIGHT
 
+CONFIG_COLS = ["dataset", "n_fraction", "N", "d", "k", "memory_budget_mb", "recall_target"]
+
 def compute_violation_score(
     row: pd.Series,
     memory_weight: float = MEMORY_VIOLATION_WEIGHT,
@@ -18,6 +20,28 @@ def compute_violation_score(
     rec_violation = max(0.0, row["recall_target"] - row["recall_at_k"])
     return memory_weight * mem_violation + recall_weight * rec_violation
 
+
+def _restore_group_config_columns(group: pd.DataFrame) -> pd.DataFrame:
+    """Reattach group-by keys when pandas excludes grouping columns in apply()."""
+    missing = [col for col in CONFIG_COLS if col not in group.columns]
+    if not missing:
+        return group
+
+    if not hasattr(group, "name"):
+        missing_str = ", ".join(missing)
+        raise KeyError(f"Grouped dataframe is missing required config columns: {missing_str}")
+
+    key = group.name
+    if not isinstance(key, tuple):
+        key = (key,)
+    if len(key) != len(CONFIG_COLS):
+        raise KeyError("Grouped dataframe is missing config columns and group key shape is unexpected")
+
+    restored = group.copy()
+    for col, value in zip(CONFIG_COLS, key):
+        restored[col] = value
+    return restored
+
 def select_winner(group: pd.DataFrame) -> str:
     """Given rows for one configuration (one row per index_type), return the winning index.
 
@@ -25,6 +49,7 @@ def select_winner(group: pd.DataFrame) -> str:
     If none feasible: argmin(violation_score).
     # TODO: define exact tiebreak rule when violation scores are equal.
     """
+    group = _restore_group_config_columns(group)
     scores = group.apply(compute_violation_score, axis=1)
     feasible = group[scores == 0.0]
 
@@ -41,14 +66,14 @@ def label_benchmarks(df: pd.DataFrame) -> pd.DataFrame:
     Groups by all config columns except index_type. Returns df with added
     'label' column (the winning index type string for each row's config).
     """
-    config_cols = ["dataset", "n_fraction", "N", "d", "k", "memory_budget_mb", "recall_target"]
     labels = (
-        df.groupby(config_cols, group_keys=False)
+        df.groupby(CONFIG_COLS, group_keys=False)
         .apply(_assign_winner_label)
     )
     return labels
 
 def _assign_winner_label(group: pd.DataFrame) -> pd.DataFrame:
+    group = _restore_group_config_columns(group)
     winner = select_winner(group)
     group = group.copy()
     group["label"] = winner
@@ -75,7 +100,6 @@ def balance_labels(
     if not dominant:
         return df
 
-    config_cols = ["dataset", "n_fraction", "N", "d", "k", "memory_budget_mb", "recall_target"]
     rng = np.random.default_rng(seed)
 
     minority_size = min(
@@ -87,10 +111,10 @@ def balance_labels(
         subset = df[df["label"] == label]
         if label in dominant:
             # subsample to minority_size rows, keeping whole config groups intact
-            configs = subset[config_cols].drop_duplicates()
+            configs = subset[CONFIG_COLS].drop_duplicates()
             n_keep = max(1, int(minority_size / len(subset) * len(configs)))
             chosen = configs.sample(n=min(n_keep, len(configs)), random_state=int(rng.integers(0, 2**31)))
-            subset = subset.merge(chosen, on=config_cols)
+            subset = subset.merge(chosen, on=CONFIG_COLS)
         parts.append(subset)
 
     return pd.concat(parts).reset_index(drop=True)

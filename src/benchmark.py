@@ -22,6 +22,17 @@ from src.index_builder import build_index
 from src.utils import compute_recall_at_k, measure_peak_memory_mb, subsample_vectors
 
 
+def _format_params(params: dict) -> str:
+    """Render index params in a stable, compact format for logs."""
+    return ", ".join(f"{key}={value}" for key, value in sorted(params.items()))
+
+
+def _log(verbose: bool, message: str) -> None:
+    """Print benchmark progress messages only when verbose logging is enabled."""
+    if verbose:
+        print(message, flush=True)
+
+
 def query_index(
     index: faiss.Index,
     query_vectors: np.ndarray,
@@ -32,20 +43,34 @@ def query_index(
     Queries are run one at a time for consistent per-query timing.
     """
     query_vectors = np.ascontiguousarray(query_vectors, dtype=np.float32)
-    latencies = []
-    all_indices = []
+    n_queries = len(query_vectors)
+    latencies = np.empty(n_queries, dtype=np.float64)
+    retrieved = np.empty((n_queries, k), dtype=np.int64)
 
-    for q in query_vectors:
+    for i, q in enumerate(query_vectors):
         q_row = q[np.newaxis, :]
         t0 = time.perf_counter()
         _, I = index.search(q_row, k)
-        latencies.append((time.perf_counter() - t0) * 1000)
-        all_indices.append(I[0])
+        latencies[i] = (time.perf_counter() - t0) * 1000
+        retrieved[i] = I[0]
 
-    retrieved = np.array(all_indices, dtype=np.int64)
     mean_lat = float(np.mean(latencies))
     p99_lat = float(np.percentile(latencies, 99))
     return retrieved, mean_lat, p99_lat
+
+
+def compute_exact_ground_truth(
+    base_vectors: np.ndarray,
+    query_vectors: np.ndarray,
+    k: int,
+) -> np.ndarray:
+    """Compute exact top-k neighbors for the current indexed base vectors."""
+    base_vectors = np.ascontiguousarray(base_vectors, dtype=np.float32)
+    query_vectors = np.ascontiguousarray(query_vectors, dtype=np.float32)
+    exact_index = faiss.IndexFlatL2(base_vectors.shape[1])
+    exact_index.add(base_vectors)
+    _, neighbors = exact_index.search(query_vectors, k)
+    return neighbors
 
 
 def benchmark_single(
@@ -94,7 +119,11 @@ def _timed_build(
     return index, time.perf_counter() - t0
 
 
-def run_benchmark(data_dir: Path, results_dir: Path) -> pd.DataFrame:
+def run_benchmark(
+    data_dir: Path,
+    results_dir: Path,
+    verbose: bool = False,
+) -> pd.DataFrame:
     """Build each (dataset, N_fraction, index_type) once, query per k, cross-join constraints.
 
     memory_budget_mb and recall_target are added as columns — they don't affect
@@ -110,21 +139,43 @@ def run_benchmark(data_dir: Path, results_dir: Path) -> pd.DataFrame:
 
     with tqdm(total=n_builds, desc="benchmarking") as bar:
         for dataset_name in DATASETS:
-            train, queries, gt = load_dataset(dataset_name, data_dir)
+            train, queries, _ = load_dataset(dataset_name, data_dir)
+            queries = np.ascontiguousarray(queries, dtype=np.float32)
             d = train.shape[1]
 
             for fraction in N_FRACTIONS:
                 sub_train = subsample_vectors(train, fraction)
                 n = len(sub_train)
+                exact_gt = compute_exact_ground_truth(sub_train, queries, max(K_VALUES))
+                _log(
+                    verbose,
+                    f"[benchmark] dataset={dataset_name} n_fraction={fraction:.2f} "
+                    f"N={n} d={d} exact_gt_k={max(K_VALUES)}",
+                )
 
                 for index_type in INDEX_TYPES:
                     params = _adapt_params(index_type, n)
                     (index, build_time_s), peak_mb = measure_peak_memory_mb(
                         _timed_build, index_type, sub_train, params
                     )
+                    _log(
+                        verbose,
+                        f"[build] dataset={dataset_name} index={index_type} "
+                        f"n_fraction={fraction:.2f} params=({_format_params(params)}) "
+                        f"peak_memory_mb={peak_mb:.2f} build_time_s={build_time_s:.3f}",
+                    )
 
                     for k in K_VALUES:
-                        metrics = benchmark_single(index, queries, gt, k)
+                        metrics = benchmark_single(index, queries, exact_gt, k)
+                        _log(
+                            verbose,
+                            f"[query] dataset={dataset_name} index={index_type} "
+                            f"n_fraction={fraction:.2f} k={k} "
+                            f"recall_at_k={metrics['recall_at_k']:.4f} "
+                            f"mean_latency_ms={metrics['mean_latency_ms']:.4f} "
+                            f"p99_latency_ms={metrics['p99_latency_ms']:.4f} "
+                            f"peak_memory_mb={peak_mb:.2f}",
+                        )
 
                         for mem_budget in MEMORY_BUDGETS_MB:
                             for recall_target in RECALL_TARGETS:

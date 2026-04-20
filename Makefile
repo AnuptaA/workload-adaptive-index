@@ -1,7 +1,8 @@
-.PHONY: install download benchmark label hello test clean all
+.PHONY: install download benchmark plot label hello test clean all
 
 PYTHON_BIN ?= python3
 PYTHON := PYTHONPATH=$(CURDIR) $(PYTHON_BIN)
+BENCHMARK_FLAGS ?=
 
 install:
 	pip install -r requirements.txt
@@ -10,7 +11,10 @@ download:
 	$(PYTHON) scripts/download_datasets.py --data-dir data/
 
 benchmark:
-	$(PYTHON) scripts/run_benchmark.py --data-dir data/ --results-dir results/
+	$(PYTHON) scripts/run_benchmark.py --data-dir data/ --results-dir results/ $(BENCHMARK_FLAGS)
+
+plot:
+	MPLCONFIGDIR=$(CURDIR)/.mplconfig XDG_CACHE_HOME=$(CURDIR)/.cache $(PYTHON) scripts/plot_benchmarks.py --results-csv results/benchmarks.csv --output-dir results/plots
 
 label:
 	$(PYTHON) scripts/label_data.py --results-dir results/
