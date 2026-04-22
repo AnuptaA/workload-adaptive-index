@@ -29,6 +29,60 @@ def _lookup_performance(
     perf_df = pd.DataFrame(rows)
     return pd.concat([result.reset_index(drop=True), perf_df], axis=1)
 
+
+def mean_latency_for_labels(
+    test_df: pd.DataFrame,
+    benchmarks: pd.DataFrame,
+    labels: list[str],
+) -> float:
+    """Mean measured ``mean_latency_ms`` across configs for the given index choice per row."""
+    perf = _lookup_performance(test_df, benchmarks, labels)
+    return float(perf["mean_latency_ms"].mean())
+
+
+def expected_mean_latency_uniform_random(
+    test_df: pd.DataFrame,
+    benchmarks: pd.DataFrame,
+) -> float:
+    """Expected mean latency if the index is chosen uniformly over ``INDEX_TYPES``.
+
+    For each config, this is the average of measured ``mean_latency_ms`` across
+    the three index types (one value per type; benchmarks repeat the same metric
+    across ``memory_budget_mb`` / ``recall_target``).
+    """
+    means: list[float] = []
+    for _, cfg in test_df.iterrows():
+        mask = pd.Series(True, index=benchmarks.index)
+        for col in _CONFIG_COLS:
+            mask &= benchmarks[col] == cfg[col]
+        sub = benchmarks[mask]
+        if sub.empty:
+            continue
+        per_type = sub.groupby("index_type", sort=False)["mean_latency_ms"].first()
+        if set(per_type.index) != set(INDEX_TYPES):
+            continue
+        means.append(float(np.mean([float(per_type[t]) for t in INDEX_TYPES])))
+    if not means:
+        return float("nan")
+    return float(np.mean(means))
+
+
+def random_mean_latency_monte_carlo(
+    test_df: pd.DataFrame,
+    benchmarks: pd.DataFrame,
+    n_trials: int,
+    seed: int = RANDOM_SEED,
+) -> tuple[float, float]:
+    """Mean and standard error of the per-trial average latency (one random draw per config)."""
+    rng = np.random.default_rng(seed)
+    trial_means: list[float] = []
+    for _ in range(n_trials):
+        labels = rng.choice(INDEX_TYPES, size=len(test_df)).tolist()
+        trial_means.append(mean_latency_for_labels(test_df, benchmarks, labels))
+    arr = np.asarray(trial_means, dtype=np.float64)
+    return float(arr.mean()), float(arr.std(ddof=1) / np.sqrt(len(arr)))
+
+
 def always_hnsw(
     test_df: pd.DataFrame, benchmarks: pd.DataFrame
 ) -> pd.DataFrame:
