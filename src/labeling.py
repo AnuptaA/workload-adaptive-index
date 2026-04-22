@@ -21,6 +21,38 @@ def compute_violation_score(
     return memory_weight * mem_violation + recall_weight * rec_violation
 
 
+def choose_index_from_metrics(candidates: pd.DataFrame) -> str:
+    """Pick an index type using the same rule as training labels.
+
+    ``candidates`` must include: ``index_type``, ``mean_latency_ms``,
+    ``peak_memory_mb``, ``recall_at_k``, ``memory_budget_mb``, ``recall_target``.
+    Among rows with ``compute_violation_score`` == 0, return the one with minimum
+    ``mean_latency_ms``. If none are feasible, return the row with minimum
+    violation score.
+    """
+    required = {
+        "index_type",
+        "mean_latency_ms",
+        "peak_memory_mb",
+        "recall_at_k",
+        "memory_budget_mb",
+        "recall_target",
+    }
+    missing = required - set(candidates.columns)
+    if missing:
+        raise KeyError(f"candidates dataframe missing columns: {sorted(missing)}")
+
+    scores = candidates.apply(compute_violation_score, axis=1)
+    feasible = candidates[scores == 0.0]
+
+    if not feasible.empty:
+        winner_idx = feasible["mean_latency_ms"].idxmin()
+    else:
+        winner_idx = scores.idxmin()
+
+    return str(candidates.loc[winner_idx, "index_type"])
+
+
 def _restore_group_config_columns(group: pd.DataFrame) -> pd.DataFrame:
     """Reattach group-by keys when pandas excludes grouping columns in apply()."""
     missing = [col for col in CONFIG_COLS if col not in group.columns]
@@ -50,15 +82,7 @@ def select_winner(group: pd.DataFrame) -> str:
     # TODO: define exact tiebreak rule when violation scores are equal.
     """
     group = _restore_group_config_columns(group)
-    scores = group.apply(compute_violation_score, axis=1)
-    feasible = group[scores == 0.0]
-
-    if not feasible.empty:
-        winner_idx = feasible["mean_latency_ms"].idxmin()
-    else:
-        winner_idx = scores.idxmin()
-
-    return group.loc[winner_idx, "index_type"]
+    return choose_index_from_metrics(group)
 
 def label_benchmarks(df: pd.DataFrame) -> pd.DataFrame:
     """Apply select_winner per configuration group.
