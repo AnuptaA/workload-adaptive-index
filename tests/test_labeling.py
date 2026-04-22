@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from src.config import MEMORY_VIOLATION_WEIGHT, RECALL_VIOLATION_WEIGHT
 from src.labeling import (
     balance_labels,
     check_class_distribution,
@@ -44,19 +45,22 @@ class TestComputeViolationScore:
     def test_memory_violation_only(self):
         row = pd.Series(_make_row("HNSW", peak_memory_mb=300, memory_budget_mb=256,
                                   recall_at_k=0.95, recall_target=0.90))
-        expected = 1.0 * ((300 - 256) / 256)
+        expected = MEMORY_VIOLATION_WEIGHT * ((300 - 256) / 256)
         assert compute_violation_score(row) == pytest.approx(expected)
 
     def test_recall_violation_only(self):
         row = pd.Series(_make_row("HNSW", peak_memory_mb=100, memory_budget_mb=256,
                                   recall_at_k=0.80, recall_target=0.95))
-        expected = 2.0 * (0.95 - 0.80)
+        expected = RECALL_VIOLATION_WEIGHT * (0.95 - 0.80)
         assert compute_violation_score(row) == pytest.approx(expected)
 
     def test_both_violations(self):
         row = pd.Series(_make_row("HNSW", peak_memory_mb=300, memory_budget_mb=256,
                                   recall_at_k=0.80, recall_target=0.95))
-        expected = 1.0 * ((300 - 256) / 256) + 2.0 * (0.95 - 0.80)
+        expected = (
+            MEMORY_VIOLATION_WEIGHT * ((300 - 256) / 256)
+            + RECALL_VIOLATION_WEIGHT * (0.95 - 0.80)
+        )
         assert compute_violation_score(row) == pytest.approx(expected)
 
 class TestSelectWinner:
