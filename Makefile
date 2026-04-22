@@ -1,4 +1,4 @@
-.PHONY: install download benchmark plot label hello test clean all
+.PHONY: install download benchmark plot label train hello test clean all
 
 PYTHON_BIN ?= python3
 PYTHON := PYTHONPATH=$(CURDIR) $(PYTHON_BIN)
@@ -18,6 +18,9 @@ plot:
 
 label:
 	$(PYTHON) scripts/label_data.py --results-dir results/
+
+train:
+	$(PYTHON) scripts/train_models.py --results-dir results/ --artifacts-dir artifacts/
 
 hello:
 	$(PYTHON) scripts/hello_world.py
