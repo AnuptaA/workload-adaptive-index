@@ -1,3 +1,4 @@
+import functools
 import numpy as np
 import pandas as pd
 
@@ -12,20 +13,24 @@ def compute_violation_score(
 ) -> float:
     """Weighted sum of constraint violations.
 
-    memory_violation = max(0, peak_memory_mb - memory_budget_mb) / memory_budget_mb
+    memory_violation = max(0, index_size_mb - memory_budget_mb) / memory_budget_mb
     recall_violation = max(0, recall_target - recall_at_k)
     score = memory_weight * memory_violation + recall_weight * recall_violation
     """
-    mem_violation = max(0.0, row["peak_memory_mb"] - row["memory_budget_mb"]) / row["memory_budget_mb"]
+    mem_violation = max(0.0, row["index_size_mb"] - row["memory_budget_mb"]) / row["memory_budget_mb"]
     rec_violation = max(0.0, row["recall_target"] - row["recall_at_k"])
     return memory_weight * mem_violation + recall_weight * rec_violation
 
 
-def choose_index_from_metrics(candidates: pd.DataFrame) -> str:
+def choose_index_from_metrics(
+    candidates: pd.DataFrame,
+    memory_weight: float = MEMORY_VIOLATION_WEIGHT,
+    recall_weight: float = RECALL_VIOLATION_WEIGHT,
+) -> str:
     """Pick an index type using the same rule as training labels.
 
     ``candidates`` must include: ``index_type``, ``mean_latency_ms``,
-    ``peak_memory_mb``, ``recall_at_k``, ``memory_budget_mb``, ``recall_target``.
+    ``index_size_mb``, ``recall_at_k``, ``memory_budget_mb``, ``recall_target``.
     Among rows with ``compute_violation_score`` == 0, return the one with minimum
     ``mean_latency_ms``. If none are feasible, return the row with minimum
     violation score.
@@ -33,7 +38,7 @@ def choose_index_from_metrics(candidates: pd.DataFrame) -> str:
     required = {
         "index_type",
         "mean_latency_ms",
-        "peak_memory_mb",
+        "index_size_mb",
         "recall_at_k",
         "memory_budget_mb",
         "recall_target",
@@ -42,7 +47,9 @@ def choose_index_from_metrics(candidates: pd.DataFrame) -> str:
     if missing:
         raise KeyError(f"candidates dataframe missing columns: {sorted(missing)}")
 
-    scores = candidates.apply(compute_violation_score, axis=1)
+    scores = candidates.apply(
+        lambda row: compute_violation_score(row, memory_weight, recall_weight), axis=1
+    )
     feasible = candidates[scores == 0.0]
 
     if not feasible.empty:
@@ -74,34 +81,46 @@ def _restore_group_config_columns(group: pd.DataFrame) -> pd.DataFrame:
         restored[col] = value
     return restored
 
-def select_winner(group: pd.DataFrame) -> str:
+def select_winner(
+    group: pd.DataFrame,
+    memory_weight: float = MEMORY_VIOLATION_WEIGHT,
+    recall_weight: float = RECALL_VIOLATION_WEIGHT,
+) -> str:
     """Given rows for one configuration (one row per index_type), return the winning index.
 
     Among feasible indices (violation_score == 0): argmin(mean_latency_ms).
     If none feasible: argmin(violation_score).
-    # TODO: define exact tiebreak rule when violation scores are equal.
     """
     group = _restore_group_config_columns(group)
-    return choose_index_from_metrics(group)
+    return choose_index_from_metrics(group, memory_weight, recall_weight)
 
-def label_benchmarks(df: pd.DataFrame) -> pd.DataFrame:
+
+def _assign_winner_label(
+    group: pd.DataFrame,
+    memory_weight: float = MEMORY_VIOLATION_WEIGHT,
+    recall_weight: float = RECALL_VIOLATION_WEIGHT,
+) -> pd.DataFrame:
+    group = _restore_group_config_columns(group)
+    winner = select_winner(group, memory_weight, recall_weight)
+    group = group.copy()
+    group["label"] = winner
+    return group
+
+
+def label_benchmarks(
+    df: pd.DataFrame,
+    memory_weight: float = MEMORY_VIOLATION_WEIGHT,
+    recall_weight: float = RECALL_VIOLATION_WEIGHT,
+) -> pd.DataFrame:
     """Apply select_winner per configuration group.
 
     Groups by all config columns except index_type. Returns df with added
     'label' column (the winning index type string for each row's config).
     """
-    labels = (
-        df.groupby(CONFIG_COLS, group_keys=False)
-        .apply(_assign_winner_label)
+    fn = functools.partial(
+        _assign_winner_label, memory_weight=memory_weight, recall_weight=recall_weight
     )
-    return labels
-
-def _assign_winner_label(group: pd.DataFrame) -> pd.DataFrame:
-    group = _restore_group_config_columns(group)
-    winner = select_winner(group)
-    group = group.copy()
-    group["label"] = winner
-    return group
+    return df.groupby(CONFIG_COLS, group_keys=False).apply(fn)
 
 def check_class_distribution(df: pd.DataFrame) -> dict[str, float]:
     """Returns label fraction per index type."""

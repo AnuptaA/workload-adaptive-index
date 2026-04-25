@@ -10,7 +10,7 @@ from src.baselines import (
     mean_latency_for_labels,
     random_mean_latency_monte_carlo,
 )
-from src.config import RANDOM_SEED
+from src.config import MEMORY_VIOLATION_WEIGHT, RANDOM_SEED, RECALL_VIOLATION_WEIGHT
 from src.features import apply_scaler
 from src.labeling import CONFIG_COLS, compute_violation_score
 
@@ -129,9 +129,10 @@ def constraint_violation_rate(
     predicted_labels: list[str],
     test_df: pd.DataFrame,
     benchmarks: pd.DataFrame,
+    memory_weight: float = MEMORY_VIOLATION_WEIGHT,
+    recall_weight: float = RECALL_VIOLATION_WEIGHT,
 ) -> float:
     """Fraction of predictions whose *measured* row violates deployment constraints."""
-    perf_cols = ["mean_latency_ms", "p99_latency_ms", "recall_at_k", "peak_memory_mb"]
     n_viol = 0
     for pred_label, (_, cfg_row) in zip(predicted_labels, test_df.iterrows()):
         mask = benchmarks["index_type"] == pred_label
@@ -143,11 +144,11 @@ def constraint_violation_rate(
             continue
         row = match.iloc[0]
         synthetic = pd.Series({
-            "peak_memory_mb": row["peak_memory_mb"],
+            "index_size_mb": row["index_size_mb"],
             "memory_budget_mb": cfg_row["memory_budget_mb"],
             "recall_at_k": row["recall_at_k"],
             "recall_target": cfg_row["recall_target"],
         })
-        if compute_violation_score(synthetic) > 0.0:
+        if compute_violation_score(synthetic, memory_weight, recall_weight) > 0.0:
             n_viol += 1
     return n_viol / len(predicted_labels) if predicted_labels else 0.0

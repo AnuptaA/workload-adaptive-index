@@ -7,9 +7,50 @@ from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import cross_val_score
 from sklearn.preprocessing import StandardScaler
 
-from src.config import INDEX_TYPES
+from src.config import INDEX_TYPES, MEMORY_VIOLATION_WEIGHT, RECALL_VIOLATION_WEIGHT
 from src.features import FEATURE_COLS, _INDEX_ONE_HOT_COLS, apply_scaler
 from src.labeling import choose_index_from_metrics
+
+
+def _resolve_artifact_base_dir(artifacts_dir: Path) -> Path:
+    """Resolve artifact directory, preferring latest timestamped run when present."""
+    artifacts_dir = Path(artifacts_dir)
+    required = [
+        artifacts_dir / "latency_model.joblib",
+        artifacts_dir / "memory_model.joblib",
+        artifacts_dir / "recall_model.joblib",
+        artifacts_dir / "scaler.joblib",
+    ]
+    if all(path.exists() for path in required):
+        return artifacts_dir
+
+    runs_root = artifacts_dir / "runs"
+    latest_file = artifacts_dir / "latest_run_id.txt"
+    if latest_file.exists():
+        run_id = latest_file.read_text(encoding="utf-8").strip()
+        candidate = runs_root / run_id
+        candidate_required = [
+            candidate / "latency_model.joblib",
+            candidate / "memory_model.joblib",
+            candidate / "recall_model.joblib",
+            candidate / "scaler.joblib",
+        ]
+        if run_id and all(path.exists() for path in candidate_required):
+            return candidate
+
+    if runs_root.exists():
+        run_dirs = sorted([p for p in runs_root.iterdir() if p.is_dir()])
+        for candidate in reversed(run_dirs):
+            candidate_required = [
+                candidate / "latency_model.joblib",
+                candidate / "memory_model.joblib",
+                candidate / "recall_model.joblib",
+                candidate / "scaler.joblib",
+            ]
+            if all(path.exists() for path in candidate_required):
+                return candidate
+
+    return artifacts_dir
 
 # --- Model ---
 
@@ -19,7 +60,7 @@ def _fit_linear_regression_with_cv(
     name: str,
     cv: int = 5,
 ) -> LinearRegression:
-    """Fit ``LinearRegression`` on all of ``X_train``; print CV RMSE for diagnostics."""
+    """Fit ``LinearRegression`` on all of ``X_train`` and print CV RMSE for diagnostics."""
     n_samples = len(X_train)
     folds = min(cv, n_samples) if n_samples >= 2 else 1
     model = LinearRegression()
@@ -66,7 +107,7 @@ def save_artifacts(
 
 def load_artifacts(artifacts_dir: Path) -> tuple[dict, StandardScaler]:
     """Load and return (models_dict, scaler) from artifacts_dir."""
-    artifacts_dir = Path(artifacts_dir)
+    artifacts_dir = _resolve_artifact_base_dir(Path(artifacts_dir))
     model_names = ["latency_model", "memory_model", "recall_model"]
     models = {name: joblib.load(artifacts_dir / f"{name}.joblib") for name in model_names}
     scaler = joblib.load(artifacts_dir / "scaler.joblib")
@@ -96,10 +137,13 @@ def predict_for_index(
         "recall": float(models["recall_model"].predict(x_scaled)[0]),
     }
 
+
 def select_index(
     workload: dict,
     models: dict,
     scaler: StandardScaler,
+    memory_weight: float = MEMORY_VIOLATION_WEIGHT,
+    recall_weight: float = RECALL_VIOLATION_WEIGHT,
 ) -> str:
     """Predict lat/mem/rec per index type, then apply the labeling objective.
 
@@ -115,9 +159,9 @@ def select_index(
         rows.append({
             "index_type": t,
             "mean_latency_ms": pred["latency"],
-            "peak_memory_mb": pred["memory"],
+            "index_size_mb": pred["memory"],
             "recall_at_k": pred["recall"],
             "memory_budget_mb": mem_budget,
             "recall_target": recall_target,
         })
-    return choose_index_from_metrics(pd.DataFrame(rows))
+    return choose_index_from_metrics(pd.DataFrame(rows), memory_weight, recall_weight)

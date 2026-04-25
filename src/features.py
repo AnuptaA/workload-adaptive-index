@@ -4,8 +4,8 @@ from sklearn.preprocessing import StandardScaler
 
 from src.config import INDEX_TYPES
 
-FEATURE_COLS = ["N", "d", "k", "memory_budget_mb", "recall_target"]
-# latency is the quantity minimized by the objective, not a feature
+FEATURE_COLS = ["N", "d", "k"]
+# memory_budget_mb and recall_target are labeling constraints, not physical workload features
 
 _INDEX_ONE_HOT_COLS = [f"index_{t}" for t in INDEX_TYPES]
 

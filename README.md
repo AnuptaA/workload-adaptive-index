@@ -82,7 +82,7 @@ make hello
 
 `results/benchmarks.csv` mixes two kinds of information:
 
-- Raw ANN measurements: `mean_latency_ms`, `p99_latency_ms`, `recall_at_k`, `peak_memory_mb`, and `build_time_s`
+- Raw ANN measurements: `mean_latency_ms`, `p99_latency_ms`, `recall_at_k`, `index_size_mb`, and `build_time_s`
 - Constraint columns for downstream decision-making: `memory_budget_mb` and `recall_target`
 
 One important caveat: the benchmark is only run once per `(dataset, n_fraction, k, index_type)`. The rows are then repeated across `memory_budget_mb` and `recall_target` so the labeling step can ask, "which index would be best if these were the deployment constraints?"
@@ -90,13 +90,13 @@ One important caveat: the benchmark is only run once per `(dataset, n_fraction, 
 That means:
 
 - Compare `mean_latency_ms` vs `recall_at_k` to understand the raw search tradeoff
-- Compare `peak_memory_mb` and `build_time_s` to understand build cost
+- Compare `index_size_mb` and `build_time_s` to understand deployment footprint vs build cost
 - Use `memory_budget_mb` and `recall_target` only to decide which raw result is feasible for a deployment setting
 
 `make plot` generates three views that separate those ideas:
 
 - `latency_vs_recall.png`: raw search-quality tradeoff
-- `build_cost_tradeoff.png`: memory/build-time tradeoff
+- `build_cost_tradeoff.png`: index-size/build-time tradeoff
 - `constraint_winners.png`: which index wins after applying memory and recall constraints
 
 ## Layout

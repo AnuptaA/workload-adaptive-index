@@ -18,19 +18,30 @@ def download_dataset(name: str, data_dir: Path) -> Path:
     url = DATASET_URLS[name]
     dest = data_dir / f"{name}.hdf5"
 
-    if dest.exists():
+    print(f"Checking {name}...")
+    response = requests.head(url, timeout=30, allow_redirects=True)
+    response.raise_for_status()
+    expected_size = int(response.headers.get("content-length", 0))
+
+    if dest.exists() and (expected_size == 0 or dest.stat().st_size == expected_size):
         return dest
 
+    if dest.exists():
+        print(f"Partial download detected for {name} ({dest.stat().st_size} / {expected_size} bytes). Re-downloading.")
+        dest.unlink()
+
+    tmp = dest.with_suffix(".tmp")
     print(f"Downloading {name} from {url}")
     response = requests.get(url, stream=True, timeout=120)
     response.raise_for_status()
 
     total = int(response.headers.get("content-length", 0))
-    with dest.open("wb") as f, tqdm(total=total, unit="B", unit_scale=True) as bar:
+    with tmp.open("wb") as f, tqdm(total=total, unit="B", unit_scale=True) as bar:
         for chunk in response.iter_content(chunk_size=1 << 20):
             f.write(chunk)
             bar.update(len(chunk))
 
+    tmp.rename(dest)
     return dest
 
 def load_dataset(

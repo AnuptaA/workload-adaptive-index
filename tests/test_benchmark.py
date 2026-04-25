@@ -72,13 +72,17 @@ class TestBenchmarkSingle:
         assert result["mean_latency_ms"] > 0
         assert result["p99_latency_ms"] > 0
 
-    def test_perfect_recall_on_train_vectors(self):
-        """Searching train vectors against a flat L2 index should give recall=1.0."""
-        import faiss as _faiss
+    def test_perfect_recall_on_exact_index(self):
+        """Flat L2 index IS exact search, so recall against its own ground truth must be 1.0."""
+        from src.benchmark import compute_exact_ground_truth
         rng = np.random.default_rng(42)
-        vecs = rng.random((200, 16)).astype(np.float32)
+        train_vecs = rng.random((200, 16)).astype(np.float32)
+        query_vecs = rng.random((30, 16)).astype(np.float32)
+        # compute_exact_ground_truth builds a FlatL2 internally; querying the same flat index
+        # must agree with it exactly
+        import faiss as _faiss
         flat = _faiss.IndexFlatL2(16)
-        flat.add(vecs)
-        gt = np.tile(np.arange(len(vecs)), (len(vecs), 1)).astype(np.int32)
-        result = benchmark_single(flat, vecs, gt, k=1)
+        flat.add(train_vecs)
+        gt = compute_exact_ground_truth(train_vecs, query_vecs, k=5)
+        result = benchmark_single(flat, query_vecs, gt, k=5)
         assert result["recall_at_k"] == pytest.approx(1.0)

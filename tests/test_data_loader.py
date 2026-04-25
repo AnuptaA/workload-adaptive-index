@@ -51,7 +51,11 @@ class TestDownloadDataset:
     def test_skips_if_exists(self, tmp_path):
         dest = tmp_path / "sift-1M.hdf5"
         dest.touch()
-        with patch("src.data_loader.requests.get") as mock_get:
+        # HEAD returns no content-length (0) so the existing file is treated as complete
+        mock_head_response = MagicMock()
+        mock_head_response.headers.get.return_value = 0
+        with patch("src.data_loader.requests.head", return_value=mock_head_response), \
+             patch("src.data_loader.requests.get") as mock_get:
             result = download_dataset("sift-1M", tmp_path)
             mock_get.assert_not_called()
         assert result == dest

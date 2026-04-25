@@ -2,9 +2,9 @@ import numpy as np
 import pandas as pd
 
 from src.config import INDEX_TYPES, RANDOM_SEED
+from src.labeling import CONFIG_COLS
 
-_CONFIG_COLS = ["dataset", "n_fraction", "N", "d", "k", "memory_budget_mb", "recall_target"]
-_PERF_COLS = ["mean_latency_ms", "p99_latency_ms", "recall_at_k", "peak_memory_mb"]
+_PERF_COLS = ["mean_latency_ms", "p99_latency_ms", "recall_at_k", "index_size_mb"]
 
 def _lookup_performance(
     test_df: pd.DataFrame,
@@ -12,19 +12,24 @@ def _lookup_performance(
     labels: list[str],
 ) -> pd.DataFrame:
     """For each row in test_df, look up measured performance of the given index label."""
-    result = test_df[_CONFIG_COLS].copy()
+    result = test_df[CONFIG_COLS].copy()
     result["predicted_index"] = labels
 
     rows = []
+    missing = 0
     for (_, cfg_row), label in zip(test_df.iterrows(), labels):
         mask = benchmarks["index_type"] == label
-        for col in _CONFIG_COLS:
+        for col in CONFIG_COLS:
             mask &= benchmarks[col] == cfg_row[col]
         match = benchmarks[mask]
         if match.empty:
             rows.append({col: float("nan") for col in _PERF_COLS})
+            missing += 1
         else:
             rows.append(match.iloc[0][_PERF_COLS].to_dict())
+
+    if missing:
+        print(f"Warning: {missing}/{len(labels)} benchmark lookups returned no match.")
 
     perf_df = pd.DataFrame(rows)
     return pd.concat([result.reset_index(drop=True), perf_df], axis=1)
@@ -53,7 +58,7 @@ def expected_mean_latency_uniform_random(
     means: list[float] = []
     for _, cfg in test_df.iterrows():
         mask = pd.Series(True, index=benchmarks.index)
-        for col in _CONFIG_COLS:
+        for col in CONFIG_COLS:
             mask &= benchmarks[col] == cfg[col]
         sub = benchmarks[mask]
         if sub.empty:
@@ -105,6 +110,18 @@ def faiss_rule_based(
 ) -> pd.DataFrame:
     """Apply FAISS-style heuristic to each config, look up measured performance.
 
-    # TODO: define heuristic rules before implementing.
+    Rules (applied in order):
+    1. If raw vectors exceed memory budget (N * d * 4 bytes > budget), use IVF_PQ.
+    2. If recall_target >= 0.95, use HNSW.
+    3. Otherwise use IVF_FLAT.
     """
-    raise NotImplementedError
+    labels: list[str] = []
+    for _, row in test_df.iterrows():
+        raw_mb = float(row["N"]) * float(row["d"]) * 4.0 / (1024 ** 2)
+        if raw_mb > float(row["memory_budget_mb"]):
+            labels.append("IVF_PQ")
+        elif float(row["recall_target"]) >= 0.95:
+            labels.append("HNSW")
+        else:
+            labels.append("IVF_FLAT")
+    return _lookup_performance(test_df, benchmarks, labels)

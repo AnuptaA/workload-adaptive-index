@@ -2,10 +2,10 @@ RANDOM_SEED = 42  # used everywhere: subsampling, splits, baselines
 
 INDEX_TYPES = ["IVF_FLAT", "IVF_PQ", "HNSW"]
 DATASETS = ["sift-1M", "gist-1M", "fashion-mnist"]
-N_FRACTIONS = [0.05, 0.10, 0.20]
-MEMORY_BUDGETS_MB = [64, 128, 256, 512]
-RECALL_TARGETS = [0.90, 0.95, 0.99]
-K_VALUES = [10, 50, 100]
+N_FRACTIONS = [0.02, 0.05, 0.10, 0.15, 0.20]
+MEMORY_BUDGETS_MB = [32, 64, 128, 256, 512, 1024]
+RECALL_TARGETS = [0.85, 0.90, 0.95, 0.99]
+K_VALUES = [5, 10, 50, 100]
 
 # memory violation penalized more: memory is a system resource constraint
 MEMORY_VIOLATION_WEIGHT = 2.0

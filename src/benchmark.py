@@ -19,7 +19,7 @@ from src.config import (
 )
 from src.data_loader import load_dataset
 from src.index_builder import build_index
-from src.utils import compute_recall_at_k, measure_peak_memory_mb, subsample_vectors
+from src.utils import compute_recall_at_k, subsample_vectors
 
 
 def _format_params(params: dict) -> str:
@@ -109,14 +109,16 @@ def _adapt_params(index_type: str, n: int) -> dict:
 def _timed_build(
     index_type: str, vectors: np.ndarray, params: dict
 ) -> tuple[faiss.Index, float]:
-    """Build index and return (index, build_time_s).
-
-    Returned as a tuple so measure_peak_memory_mb captures both the index
-    object and elapsed time in a single build pass.
-    """
+    """Build index and return (index, build_time_s)."""
     t0 = time.perf_counter()
     index = build_index(index_type, vectors, params)
     return index, time.perf_counter() - t0
+
+
+def _serialized_index_size_mb(index: faiss.Index) -> float:
+    """Return deployed FAISS index footprint in MB via serialization."""
+    serialized = faiss.serialize_index(index)
+    return float(serialized.nbytes) / (1024 ** 2)
 
 
 def run_benchmark(
@@ -155,14 +157,13 @@ def run_benchmark(
 
                 for index_type in INDEX_TYPES:
                     params = _adapt_params(index_type, n)
-                    (index, build_time_s), peak_mb = measure_peak_memory_mb(
-                        _timed_build, index_type, sub_train, params
-                    )
+                    index, build_time_s = _timed_build(index_type, sub_train, params)
+                    index_size_mb = _serialized_index_size_mb(index)
                     _log(
                         verbose,
                         f"[build] dataset={dataset_name} index={index_type} "
                         f"n_fraction={fraction:.2f} params=({_format_params(params)}) "
-                        f"peak_memory_mb={peak_mb:.2f} build_time_s={build_time_s:.3f}",
+                        f"index_size_mb={index_size_mb:.2f} build_time_s={build_time_s:.3f}",
                     )
 
                     for k in K_VALUES:
@@ -174,7 +175,7 @@ def run_benchmark(
                             f"recall_at_k={metrics['recall_at_k']:.4f} "
                             f"mean_latency_ms={metrics['mean_latency_ms']:.4f} "
                             f"p99_latency_ms={metrics['p99_latency_ms']:.4f} "
-                            f"peak_memory_mb={peak_mb:.2f}",
+                            f"index_size_mb={index_size_mb:.2f}",
                         )
 
                         for mem_budget in MEMORY_BUDGETS_MB:
@@ -191,7 +192,7 @@ def run_benchmark(
                                     "mean_latency_ms": metrics["mean_latency_ms"],
                                     "p99_latency_ms": metrics["p99_latency_ms"],
                                     "recall_at_k": metrics["recall_at_k"],
-                                    "peak_memory_mb": peak_mb,
+                                    "index_size_mb": index_size_mb,
                                     "build_time_s": build_time_s,
                                 })
 
