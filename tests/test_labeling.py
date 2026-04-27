@@ -7,7 +7,6 @@ from src.labeling import (
     balance_labels,
     check_class_distribution,
     compute_violation_score,
-    label_benchmarks,
     select_winner,
 )
 

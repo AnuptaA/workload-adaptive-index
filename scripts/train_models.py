@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from src.baselines import faiss_rule_based, mean_latency_for_labels
+from src.baselines import faiss_rule_based
 from src.config import ARTIFACTS_DIR, MEMORY_VIOLATION_WEIGHT, RANDOM_SEED, RECALL_VIOLATION_WEIGHT, RESULTS_DIR
 from src.evaluate import (
     constraint_violation_rate,

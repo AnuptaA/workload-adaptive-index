@@ -8,7 +8,7 @@ from sklearn.model_selection import cross_val_score
 from sklearn.preprocessing import StandardScaler
 
 from src.config import INDEX_TYPES, MEMORY_VIOLATION_WEIGHT, RECALL_VIOLATION_WEIGHT
-from src.features import FEATURE_COLS, _INDEX_ONE_HOT_COLS, apply_scaler
+from src.features import FEATURE_COLS, apply_scaler
 from src.labeling import choose_index_from_metrics
 
 
