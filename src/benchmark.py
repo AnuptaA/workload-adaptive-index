@@ -13,9 +13,7 @@ from src.config import (
     IVF_PQ_PARAMS,
     HNSW_PARAMS,
     K_VALUES,
-    MEMORY_BUDGETS_MB,
     N_FRACTIONS,
-    RECALL_TARGETS,
 )
 from src.data_loader import load_dataset
 from src.index_builder import build_index
@@ -126,10 +124,11 @@ def run_benchmark(
     results_dir: Path,
     verbose: bool = False,
 ) -> pd.DataFrame:
-    """Build each (dataset, N_fraction, index_type) once, query per k, cross-join constraints.
+    """Build each (dataset, N_fraction, index_type) once and query per k.
 
-    memory_budget_mb and recall_target are added as columns — they don't affect
-    index building or querying, only the downstream labeling objective.
+    The downstream labeling step now derives objective-specific oracles directly
+    from measured metrics, so benchmark rows are not expanded over deployment
+    constraints.
     Saves results_dir/benchmarks.csv and returns the dataframe.
     """
     data_dir = Path(data_dir)
@@ -178,23 +177,19 @@ def run_benchmark(
                             f"index_size_mb={index_size_mb:.2f}",
                         )
 
-                        for mem_budget in MEMORY_BUDGETS_MB:
-                            for recall_target in RECALL_TARGETS:
-                                rows.append({
-                                    "dataset": dataset_name,
-                                    "n_fraction": fraction,
-                                    "N": n,
-                                    "d": d,
-                                    "k": k,
-                                    "memory_budget_mb": mem_budget,
-                                    "recall_target": recall_target,
-                                    "index_type": index_type,
-                                    "mean_latency_ms": metrics["mean_latency_ms"],
-                                    "p99_latency_ms": metrics["p99_latency_ms"],
-                                    "recall_at_k": metrics["recall_at_k"],
-                                    "index_size_mb": index_size_mb,
-                                    "build_time_s": build_time_s,
-                                })
+                        rows.append({
+                            "dataset": dataset_name,
+                            "n_fraction": fraction,
+                            "N": n,
+                            "d": d,
+                            "k": k,
+                            "index_type": index_type,
+                            "mean_latency_ms": metrics["mean_latency_ms"],
+                            "p99_latency_ms": metrics["p99_latency_ms"],
+                            "recall_at_k": metrics["recall_at_k"],
+                            "index_size_mb": index_size_mb,
+                            "build_time_s": build_time_s,
+                        })
 
                     bar.update(1)
 

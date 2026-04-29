@@ -1,6 +1,7 @@
 .PHONY: install download benchmark plot label train analyze hello test clean clean-runs all
 
-VENV = venv
+# Prefer venv/ when present; otherwise .venv/ (override: make VENV=…)
+VENV ?= $(shell if [ -x venv/bin/python ]; then echo venv; elif [ -x .venv/bin/python ]; then echo .venv; else echo venv; fi)
 PYTHON = $(VENV)/bin/python
 PIP = $(VENV)/bin/pip
 BENCHMARK_FLAGS ?=
@@ -35,10 +36,11 @@ test:
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null; \
 	find . -type d -name .pytest_cache -exec rm -rf {} + 2>/dev/null; \
+	rm -rf results artifacts; \
 	true
 
 clean-runs:
 	rm -rf results artifacts
 	mkdir -p results artifacts
 
-all: download benchmark label train
+all: download benchmark label train plot
