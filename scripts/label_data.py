@@ -1,4 +1,4 @@
-"""Label benchmark results and save labeled training pairs."""
+"""Label benchmark results and save labeled training pairs (metric oracles)."""
 
 import argparse
 import json
@@ -6,15 +6,13 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.config import MEMORY_VIOLATION_WEIGHT, RECALL_VIOLATION_WEIGHT, RESULTS_DIR
-from src.labeling import check_class_distribution, label_benchmarks
+from src.config import RESULTS_DIR
+from src.labeling import ORACLE_LABEL_COLS, check_class_distribution, label_benchmarks
 from src.run_store import resolve_run_dir
 
 
 def main(
     results_dir: Path,
-    memory_weight: float = MEMORY_VIOLATION_WEIGHT,
-    recall_weight: float = RECALL_VIOLATION_WEIGHT,
     run_id: str = "",
 ) -> None:
     results_dir = Path(results_dir)
@@ -25,20 +23,21 @@ def main(
         raise FileNotFoundError(f"{benchmarks_path} not found. Run run_benchmark.py first.")
 
     df = pd.read_csv(benchmarks_path)
-    labeled = label_benchmarks(df, memory_weight=memory_weight, recall_weight=recall_weight)
+    labeled = label_benchmarks(df)
 
-    dist = check_class_distribution(labeled)
-    print(f"Class distribution (memory_weight={memory_weight}, recall_weight={recall_weight}):")
-    for label, frac in sorted(dist.items(), key=lambda x: -x[1]):
-        print(f"  {label}: {frac:.3f}")
+    for col in ORACLE_LABEL_COLS:
+        dist = check_class_distribution(labeled, col)
+        print(f"Class distribution for {col}:")
+        for label, frac in sorted(dist.items(), key=lambda x: -x[1]):
+            print(f"  {label}: {frac:.3f}")
+        print()
 
     out = run_dir / "labeled.csv"
     labeled.to_csv(out, index=False)
     meta = {
         "run_id": resolved_run_id,
-        "memory_weight": float(memory_weight),
-        "recall_weight": float(recall_weight),
-        "cons_ratio": float(memory_weight) / float(recall_weight),
+        "objectives": ["memory", "recall", "latency", "constrained_dynamic"],
+        "oracle_columns": ORACLE_LABEL_COLS,
     }
     (run_dir / "labeling_meta.json").write_text(
         json.dumps(meta, indent=2) + "\n",
@@ -51,12 +50,10 @@ def main(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--results-dir", type=Path, default=Path(RESULTS_DIR))
-    parser.add_argument("--memory-weight", type=float, default=MEMORY_VIOLATION_WEIGHT)
-    parser.add_argument("--recall-weight", type=float, default=RECALL_VIOLATION_WEIGHT)
     parser.add_argument(
         "--run-id",
         default="",
         help="Run id to label; defaults to latest run under results/runs/.",
     )
     args = parser.parse_args()
-    main(args.results_dir, args.memory_weight, args.recall_weight, args.run_id)
+    main(args.results_dir, args.run_id)
