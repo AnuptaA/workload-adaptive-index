@@ -1,4 +1,4 @@
-"""Train latency, memory, and recall regressors."""
+"""Train objective selectors plus performance regressors for constrained selection."""
 
 import argparse
 import json
@@ -7,25 +7,43 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from src.baselines import faiss_rule_based
-from src.config import ARTIFACTS_DIR, MEMORY_VIOLATION_WEIGHT, RANDOM_SEED, RECALL_VIOLATION_WEIGHT, RESULTS_DIR
+from src.config import ARTIFACTS_DIR, RANDOM_SEED, RESULTS_DIR
 from src.evaluate import (
-    constraint_violation_rate,
+    constrained_index_selection_comparison,
     evaluate_index_selection,
-    evaluate_regressors,
-    index_selection_latency_comparison,
+    index_selection_metric_comparison,
 )
-from src.features import FEATURE_COLS, apply_scaler, build_feature_matrix, make_scaler
-from src.labeling import CONFIG_COLS
+from src.labeling import (
+    CONSTRAINED_ORACLE_LABEL,
+    CONSTRAINT_COLS,
+    CONFIG_COLS,
+    ORACLE_LATENCY_LABEL,
+    ORACLE_LABEL_COLS,
+    ORACLE_MEMORY_LABEL,
+    ORACLE_RECALL_LABEL,
+    Objective,
+    expand_constraint_grid,
+    select_winner_for_constraints,
+)
 from src.models import (
     load_artifacts,
-    save_artifacts,
-    select_index,
-    train_latency_model,
-    train_memory_model,
-    train_recall_model,
+    predict_index,
+    predict_indices_for_constraints,
+    save_selector_artifacts,
+    train_metric_regressors,
+    train_selector_model,
 )
 from src.run_store import resolve_run_dir
+
+_OBJECTIVE_SPECS: list[tuple[Objective, str]] = [
+    ("memory", ORACLE_MEMORY_LABEL),
+    ("recall", ORACLE_RECALL_LABEL),
+    ("latency", ORACLE_LATENCY_LABEL),
+]
+
+
+def _stratum_key(row: pd.Series) -> str:
+    return "|".join(str(row[c]) for c in ORACLE_LABEL_COLS)
 
 
 def _config_split(
@@ -34,21 +52,22 @@ def _config_split(
     val_frac: float,
     seed: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Stratified split by label: sample train_frac/val_frac within each label group.
+    """Stratified split by (memory, recall, latency) oracle triplet.
 
-    Keeps all index_type rows for each config together. If a label group has
-    fewer than 3 configs, all its configs go to train with a warning.
+    Keeps all index_type rows for each config together.
     """
-    configs = df[CONFIG_COLS + ["label"]].drop_duplicates(subset=CONFIG_COLS)
+    configs = df[CONFIG_COLS + ORACLE_LABEL_COLS].drop_duplicates(subset=CONFIG_COLS)
+    configs = configs.copy()
+    configs["_stratum"] = configs.apply(_stratum_key, axis=1)
     rng = np.random.default_rng(seed)
 
     train_parts, val_parts, test_parts = [], [], []
 
-    for label, group in configs.groupby("label"):
+    for strat, group in configs.groupby("_stratum", sort=False):
         n = len(group)
         perm = rng.permutation(n)
         if n < 3:
-            print(f"Warning: label '{label}' has only {n} config(s); assigning all to train.")
+            print(f"Warning: stratum '{strat}' has only {n} config(s); assigning all to train.")
             train_parts.append(group.iloc[perm][CONFIG_COLS])
             continue
         n_train = max(1, round(train_frac * n))
@@ -67,77 +86,51 @@ def _config_split(
     return _merge(train_parts), _merge(val_parts), _merge(test_parts)
 
 
-def _predict_indices_for_configs(
+def _predict_for_objective(
     test_configs: pd.DataFrame,
     models: dict,
-    scaler,
-    memory_weight: float,
-    recall_weight: float,
+    objective: Objective,
 ) -> list[str]:
-    """One ``select_index`` per unique configuration row."""
     out: list[str] = []
     for _, row in test_configs.iterrows():
-        workload = {k: float(row[k]) for k in FEATURE_COLS + ["memory_budget_mb", "recall_target"]}
-        out.append(select_index(workload, models, scaler, memory_weight, recall_weight))
+        out.append(predict_index(models, row, objective))
     return out
 
 
-def _balance_train_configs_equal_labels(train_df: pd.DataFrame, seed: int) -> pd.DataFrame:
-    """Downsample each label to the minority label count at config granularity.
-
-    This keeps all index-type rows for a selected config and avoids splitting
-    per-config groups across labels.
-    """
-    # Map each unique CONFIG_COLS tuple to an integer to avoid float-column merge instability.
-    config_tuples = [tuple(row) for row in train_df[CONFIG_COLS].to_numpy()]
-    unique_tuples = list(dict.fromkeys(config_tuples))
-    tuple_to_id = {t: i for i, t in enumerate(unique_tuples)}
-
-    work = train_df.copy()
-    work["_cfg_id"] = [tuple_to_id[t] for t in config_tuples]
-
-    id_label = work[["_cfg_id", "label"]].drop_duplicates(subset=["_cfg_id"])
-    counts = id_label["label"].value_counts()
-    if counts.empty:
-        return train_df
-
-    min_count = int(counts.min())
-    rng = np.random.default_rng(seed)
-
-    chosen_ids: list[int] = []
-    for label, group in id_label.groupby("label"):
-        if len(group) <= min_count:
-            chosen_ids.extend(group["_cfg_id"].tolist())
-        else:
-            random_state = int(rng.integers(0, 2**31))
-            chosen_ids.extend(
-                group.sample(n=min_count, random_state=random_state)["_cfg_id"].tolist()
-            )
-
-    balanced = work[work["_cfg_id"].isin(chosen_ids)].drop(columns=["_cfg_id"])
-
-    # Verify using the same ID mapping (no float-column merge).
-    post_tuples = [tuple(row) for row in balanced[CONFIG_COLS].to_numpy()]
-    post_id_label = (
-        balanced.assign(_cfg_id=[tuple_to_id[t] for t in post_tuples])
-        [["_cfg_id", "label"]].drop_duplicates(subset=["_cfg_id"])
-    )
-    post_counts = post_id_label["label"].value_counts()
-    if post_counts.empty:
-        raise ValueError("Balanced train split is empty after downsampling.")
-    if int(post_counts.min()) != int(post_counts.max()):
-        raise ValueError(
-            "Train downsampling failed to equalize labels. "
-            f"Counts={post_counts.to_dict()}"
-        )
-
-    return balanced
+def _predict_for_constraints(
+    test_configs: pd.DataFrame,
+    models: dict,
+) -> list[str]:
+    return predict_indices_for_constraints(models, test_configs)
 
 
-def _config_label_counts(df: pd.DataFrame) -> dict[str, int]:
+def _constrained_training_table(df: pd.DataFrame) -> pd.DataFrame:
+    """Cross configs with deployment constraints and compute constrained oracle labels."""
+    constraint_grid = expand_constraint_grid(df)
+    rows: list[dict] = []
+    for _, group in df.groupby(CONFIG_COLS, sort=False):
+        config = group.iloc[0][CONFIG_COLS].to_dict()
+        mask = pd.Series(True, index=constraint_grid.index)
+        for col, value in config.items():
+            mask &= constraint_grid[col] == value
+        matching_constraints = constraint_grid[mask]
+        for _, constraint_row in matching_constraints.iterrows():
+            rows.append({
+                **config,
+                **{col: float(constraint_row[col]) for col in CONSTRAINT_COLS},
+                CONSTRAINED_ORACLE_LABEL: select_winner_for_constraints(
+                    group,
+                    float(constraint_row["memory_budget_mb"]),
+                    float(constraint_row["recall_target"]),
+                ),
+            })
+    return pd.DataFrame(rows, columns=CONFIG_COLS + CONSTRAINT_COLS + [CONSTRAINED_ORACLE_LABEL])
+
+
+def _config_label_counts(df: pd.DataFrame, label_col: str) -> dict[str, int]:
     """Return label counts at config granularity for a split."""
-    config_labels = df[CONFIG_COLS + ["label"]].drop_duplicates(subset=CONFIG_COLS)
-    counts = config_labels["label"].value_counts()
+    config_labels = df[CONFIG_COLS + [label_col]].drop_duplicates(subset=CONFIG_COLS)
+    counts = config_labels[label_col].value_counts()
     return {str(label): int(counts[label]) for label in counts.index}
 
 
@@ -146,7 +139,6 @@ def _save_split_artifacts(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
     test_df: pd.DataFrame,
-    balance_train_labels: bool,
     seed: int,
 ) -> None:
     """Persist split tables and balancing metadata for reproducibility."""
@@ -157,12 +149,15 @@ def _save_split_artifacts(
     val_df.to_csv(splits_dir / "val.csv", index=False)
     test_df.to_csv(splits_dir / "test.csv", index=False)
 
+    meta_counts = {}
+    for obj_name, col in _OBJECTIVE_SPECS:
+        meta_counts[f"train_{obj_name}_oracle_label_counts"] = _config_label_counts(train_df, col)
+        meta_counts[f"val_{obj_name}_oracle_label_counts"] = _config_label_counts(val_df, col)
+        meta_counts[f"test_{obj_name}_oracle_label_counts"] = _config_label_counts(test_df, col)
+
     metadata = {
         "seed": int(seed),
-        "balance_train_labels": bool(balance_train_labels),
-        "train_config_label_counts": _config_label_counts(train_df),
-        "val_config_label_counts": _config_label_counts(val_df),
-        "test_config_label_counts": _config_label_counts(test_df),
+        **meta_counts,
         "train_rows": int(len(train_df)),
         "val_rows": int(len(val_df)),
         "test_rows": int(len(test_df)),
@@ -173,50 +168,48 @@ def _save_split_artifacts(
     )
 
 
-def _print_coefficients(models: dict, feature_names: list[str]) -> None:
-    """Print LinearRegression coefficients for each regressor, sorted by |coef|."""
-    targets = {
-        "latency_model": "mean_latency_ms",
-        "memory_model": "index_size_mb",
-        "recall_model": "recall_at_k",
-    }
-    print("\nRegressor coefficients (sorted by |coef|):")
-    for model_key, target_name in targets.items():
-        model = models[model_key]
-        pairs = sorted(
-            zip(feature_names, model.coef_), key=lambda x: abs(x[1]), reverse=True
-        )
-        print(f"  {target_name}:")
-        for feat, coef in pairs:
-            print(f"    {feat:30s} {coef:+.6f}")
-
-
-def _print_latency_comparison(
-    title: str, report: dict[str, float], random_mc_trials: int, rule_based_ms: float
+def _print_metric_comparison(
+    title: str,
+    objective: Objective,
+    report: dict[str, float | str],
+    random_mc_trials: int,
 ) -> None:
-    print(f"\n{title} (mean measured query latency ms, benchmark lookup)")
-    print(f"  Oracle winner (tabular label):     {report['oracle_mean_latency_ms']:.6f}")
-    print(f"  Trained selector (predictions):   {report['model_mean_latency_ms']:.6f}")
-    print(f"  Rule-based (FAISS heuristic):     {rule_based_ms:.6f}")
-    print(f"  Always HNSW:                      {report['always_hnsw_mean_latency_ms']:.6f}")
+    metric = str(report["metric"])
+    label = {"memory": "index size (MB)", "recall": "recall@k", "latency": "latency (ms)"}[objective]
+    print(f"\n{title} — objective={objective} ({label}, benchmark lookup)")
+    print(f"  Oracle (tabular):                  {report['oracle_mean']:.6f}")
+    print(f"  Trained selector:                  {report['model_mean']:.6f}")
+    print(f"  Always HNSW:                      {report['always_hnsw_mean']:.6f}")
+    print(f"  Uniform random (exact E[.]):      {report['uniform_random_expected_mean']:.6f}")
     print(
-        f"  Uniform random (exact E[.]):      {report['uniform_random_expected_mean_latency_ms']:.6f}"
+        f"  Uniform random (MC mean +/- SE): {report['random_policy_mc_mean']:.6f} "
+        f"+/- {report['random_policy_mc_se']:.6f} ({random_mc_trials} trials)"
     )
-    print(
-        f"  Uniform random (MC mean +/- SE):  {report['random_policy_mc_mean_latency_ms']:.6f} "
-        f"+/- {report['random_policy_mc_se_latency_ms']:.6f} ({random_mc_trials} trials)"
-    )
+
+
+def _print_constrained_summary(
+    title: str,
+    report: dict[str, float | str],
+    accuracy: float,
+) -> None:
+    print(f"\n{title} — objective=constrained (penalty score over constraint grid)")
+    print(f"  Accuracy vs oracle:                       {accuracy:.4f}")
+    print(f"  Oracle objective score:                   {report['oracle_mean_objective_score']:.6f}")
+    print(f"  Regressor policy objective score:        {report['model_mean_objective_score']:.6f}")
+    print(f"  Rule-based objective score:               {report['rule_based_mean_objective_score']:.6f}")
+    print(f"  Always HNSW objective score:              {report['always_hnsw_mean_objective_score']:.6f}")
+    print(f"  Regressor policy constraint satisfaction: {report['model_constraint_satisfaction_rate']:.4f}")
+    print(f"  Regressor policy mean latency (ms):       {report['model_mean_latency_ms']:.6f}")
+    print(f"  Regressor policy mean memory overrun:     {report['model_mean_memory_overrun']:.6f}")
+    print(f"  Regressor policy mean recall shortfall:   {report['model_mean_recall_shortfall']:.6f}")
 
 
 def main(
     results_dir: Path,
     artifacts_dir: Path,
-    memory_weight: float = MEMORY_VIOLATION_WEIGHT,
-    recall_weight: float = RECALL_VIOLATION_WEIGHT,
     run_id: str = "",
     seed: int = RANDOM_SEED,
     random_mc_trials: int = 400,
-    balance_train_labels: bool = True,
 ) -> None:
     results_dir = Path(results_dir)
     artifacts_dir = Path(artifacts_dir)
@@ -238,130 +231,108 @@ def main(
 
     train_df, val_df, test_df = _config_split(df, 0.70, 0.15, seed)
 
-    if balance_train_labels:
-        pre = train_df[CONFIG_COLS + ["label"]].drop_duplicates(subset=CONFIG_COLS)
-        pre_dist = pre["label"].value_counts().to_dict()
-        train_df = _balance_train_configs_equal_labels(train_df, seed)
-        post = train_df[CONFIG_COLS + ["label"]].drop_duplicates(subset=CONFIG_COLS)
-        post_dist = post["label"].value_counts().to_dict()
-        print("Balanced train configs to minority label count:")
-        print(f"  before: {pre_dist}")
-        print(f"  after:  {post_dist}")
-
-        # Additional explicit safety check.
-        if post_dist and (min(post_dist.values()) != max(post_dist.values())):
-            raise ValueError(f"Train labels not strictly balanced after downsampling: {post_dist}")
-
     _save_split_artifacts(
         run_dir,
         train_df,
         val_df,
         test_df,
-        balance_train_labels,
         seed,
     )
 
-    for split_name, split_df in (("train", train_df), ("val", val_df), ("test", test_df)):
-        n_configs = split_df[CONFIG_COLS].drop_duplicates().shape[0]
-        dist = split_df[CONFIG_COLS + ["label"]].drop_duplicates(subset=CONFIG_COLS)["label"].value_counts().to_dict()
-        print(f"  {split_name}: {n_configs} configs | {dist}")
+    winners_train = train_df[CONFIG_COLS + ORACLE_LABEL_COLS].drop_duplicates(subset=CONFIG_COLS)
+    constrained_train = _constrained_training_table(train_df)
 
-    X_train, feature_names = build_feature_matrix(train_df)
-    X_val, _ = build_feature_matrix(val_df)
-    X_test, _ = build_feature_matrix(test_df)
+    models_dict = {}
+    for objective, oracle_col in _OBJECTIVE_SPECS:
+        y = winners_train[oracle_col].astype(str)
+        pipe = train_selector_model(winners_train, y, seed=seed)
+        models_dict[f"{objective}_selector_model"] = pipe
 
-    scaler = make_scaler(X_train)
-    X_train_s = apply_scaler(X_train, scaler)
+    models_dict.update(train_metric_regressors(train_df, seed=seed))
 
-    y_lat_train = train_df["mean_latency_ms"].to_numpy()
-    y_mem_train = train_df["index_size_mb"].to_numpy()
-    y_rec_train = train_df["recall_at_k"].to_numpy()
-
-    print("Training regressors (CV on train rows):")
-    latency_model = train_latency_model(X_train_s, y_lat_train)
-    memory_model = train_memory_model(X_train_s, y_mem_train)
-    recall_model = train_recall_model(X_train_s, y_rec_train)
-
-    models = {
-        "latency_model": latency_model,
-        "memory_model": memory_model,
-        "recall_model": recall_model,
-    }
-    save_artifacts(models, scaler, run_artifacts_dir)
+    save_selector_artifacts(models_dict, run_artifacts_dir)
     (artifacts_dir / "latest_run_id.txt").write_text(f"{resolved_run_id}\n", encoding="utf-8")
     print(f"Run id: {resolved_run_id}")
-    print(f"Saved models and scaler to {run_artifacts_dir}")
+    print(f"Saved selector and performance models to {run_artifacts_dir}")
 
-    _print_coefficients(models, feature_names)
-
-    train_metrics = evaluate_regressors(
-        models, scaler, X_train,
-        train_df["mean_latency_ms"].to_numpy(),
-        train_df["index_size_mb"].to_numpy(),
-        train_df["recall_at_k"].to_numpy(),
-        "train",
+    for split_name, split_df in (("train", train_df), ("val", val_df), ("test", test_df)):
+        n_configs = split_df[CONFIG_COLS].drop_duplicates().shape[0]
+        parts = []
+        for objective, col in _OBJECTIVE_SPECS:
+            dist = (
+                split_df[CONFIG_COLS + [col]].drop_duplicates(subset=CONFIG_COLS)[col]
+                .value_counts().to_dict()
+            )
+            parts.append(f"{objective}={dist}")
+        print(f"  {split_name}: {n_configs} configs | " + " | ".join(parts))
+    print(
+        "  constrained grid: "
+        f"{len(expand_constraint_grid(train_df)) // max(1, train_df[CONFIG_COLS].drop_duplicates().shape[0])} "
+        "constraints per config"
     )
-    print("train RMSE (in-sample):", train_metrics)
+    print("  constrained policy: metric regressors -> predicted metrics -> objective score")
 
-    for split_name, X_split, part in (
-        ("val", X_val, val_df),
-        ("test", X_test, test_df),
-    ):
-        metrics = evaluate_regressors(
-            models, scaler, X_split,
-            part["mean_latency_ms"].to_numpy(),
-            part["index_size_mb"].to_numpy(),
-            part["recall_at_k"].to_numpy(),
-            split_name,
-        )
-        print(f"{split_name} RMSE:", metrics)
+    models_loaded = load_artifacts(run_artifacts_dir)
 
-    for split_name, split_df in (("Validation", val_df), ("Test", test_df)):
-        configs = split_df[CONFIG_COLS + ["label"]].drop_duplicates(subset=CONFIG_COLS)
-        predicted = _predict_indices_for_configs(configs, models, scaler, memory_weight, recall_weight)
-        report = index_selection_latency_comparison(
-            configs, benchmarks, predicted,
-            random_mc_trials=random_mc_trials,
-            random_mc_seed=seed + (1 if split_name == "Validation" else 2),
-        )
-        rule_perf = faiss_rule_based(configs, benchmarks)
-        rule_ms = float(rule_perf["mean_latency_ms"].mean())
-        sel = evaluate_index_selection(predicted, configs, benchmarks)
-        viol = constraint_violation_rate(predicted, configs, benchmarks, memory_weight, recall_weight)
-        print(
-            f"\n{split_name} selection accuracy: {sel['accuracy']:.4f}, "
-            f"constraint_violation_rate={viol:.4f}"
-        )
-        _print_latency_comparison(f"{split_name} split", report, random_mc_trials, rule_ms)
+    for split_title, split_df in (("Validation", val_df), ("Test", test_df)):
+        configs = split_df[CONFIG_COLS + ORACLE_LABEL_COLS].drop_duplicates(subset=CONFIG_COLS)
 
-    # Sanity check: reload artifacts and confirm inference works.
-    models2, scaler2 = load_artifacts(run_artifacts_dir)
-    test_configs = test_df[CONFIG_COLS + ["label"]].drop_duplicates(subset=CONFIG_COLS)
-    assert len(_predict_indices_for_configs(test_configs.head(3), models2, scaler2, memory_weight, recall_weight)) == 3
+        for objective, oracle_col in _OBJECTIVE_SPECS:
+            predicted = _predict_for_objective(configs, models_loaded, objective)
+
+            report = index_selection_metric_comparison(
+                objective,
+                configs,
+                benchmarks,
+                predicted,
+                oracle_col=oracle_col,
+                random_mc_trials=random_mc_trials,
+                random_mc_seed=seed + (1 if split_title == "Validation" else 2),
+            )
+            sel = evaluate_index_selection(predicted, configs, oracle_col)
+            print(
+                f"\n{split_title} — objective={objective}: "
+                f"accuracy vs oracle={sel['accuracy']:.4f}"
+            )
+            _print_metric_comparison(
+                f"{split_title} split",
+                objective,
+                report,
+                random_mc_trials,
+            )
+
+        constrained_configs = _constrained_training_table(split_df)
+        predicted = _predict_for_constraints(constrained_configs, models_loaded)
+        report = constrained_index_selection_comparison(
+            constrained_configs,
+            benchmarks,
+            predicted,
+        )
+        sel = evaluate_index_selection(
+            predicted,
+            constrained_configs,
+            CONSTRAINED_ORACLE_LABEL,
+        )
+        _print_constrained_summary(f"{split_title} split", report, float(sel["accuracy"]))
+
+    models_check = load_artifacts(run_artifacts_dir)
+    test_configs = test_df[CONFIG_COLS + ORACLE_LABEL_COLS].drop_duplicates(subset=CONFIG_COLS)
+    assert len(_predict_for_objective(test_configs.head(3), models_check, "latency")) == 3
+    assert len(_predict_for_constraints(_constrained_training_table(test_df).head(3), models_check)) == 3
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--results-dir", type=Path, default=Path(RESULTS_DIR))
     parser.add_argument("--artifacts-dir", type=Path, default=Path(ARTIFACTS_DIR))
-    parser.add_argument("--memory-weight", type=float, default=MEMORY_VIOLATION_WEIGHT)
-    parser.add_argument("--recall-weight", type=float, default=RECALL_VIOLATION_WEIGHT)
     parser.add_argument("--run-id", default="", help="subdirectory for per-run outputs")
     parser.add_argument("--seed", type=int, default=RANDOM_SEED)
     parser.add_argument("--random-mc-trials", type=int, default=400)
-    parser.add_argument(
-        "--no-balance-train-labels",
-        action="store_true",
-        help="Disable equal-frequency downsampling of train configs by label.",
-    )
     args = parser.parse_args()
     main(
         args.results_dir,
         args.artifacts_dir,
-        args.memory_weight,
-        args.recall_weight,
         args.run_id,
         args.seed,
         args.random_mc_trials,
-        balance_train_labels=not args.no_balance_train_labels,
     )

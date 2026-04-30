@@ -47,8 +47,6 @@ make test
 # or: pytest tests/ -v
 ```
 
-**Note:** As of this revision, three unit tests in `tests/test_labeling.py` (`TestComputeViolationScore::test_memory_violation_only`, `test_recall_violation_only`, and `test_both_violations`) expect violation weights (1.0 for memory, 2.0 for recall) that do not match `MEMORY_VIOLATION_WEIGHT` / `RECALL_VIOLATION_WEIGHT` in `src/config.py`. Those tests are intentionally left failing until weights and expectations are aligned.
-
 ### 5. (Optional) Download data and run the pipeline
 
 ```bash
@@ -80,24 +78,60 @@ make hello
 
 ## Interpreting benchmark outputs
 
-`results/benchmarks.csv` mixes two kinds of information:
-
-- Raw ANN measurements: `mean_latency_ms`, `p99_latency_ms`, `recall_at_k`, `index_size_mb`, and `build_time_s`
-- Constraint columns for downstream decision-making: `memory_budget_mb` and `recall_target`
-
-One important caveat: the benchmark is only run once per `(dataset, n_fraction, k, index_type)`. The rows are then repeated across `memory_budget_mb` and `recall_target` so the labeling step can ask, "which index would be best if these were the deployment constraints?"
+`results/benchmarks.csv` stores raw ANN measurements for each `(dataset, n_fraction, k, index_type)`:
+`mean_latency_ms`, `p99_latency_ms`, `recall_at_k`, `index_size_mb`, and `build_time_s`.
 
 That means:
 
 - Compare `mean_latency_ms` vs `recall_at_k` to understand the raw search tradeoff
 - Compare `index_size_mb` and `build_time_s` to understand deployment footprint vs build cost
-- Use `memory_budget_mb` and `recall_target` only to decide which raw result is feasible for a deployment setting
+- Use `make label` / `make train` to derive objective-specific selectors:
+  memory minimizes `index_size_mb`, recall maximizes `recall_at_k`, latency minimizes `mean_latency_ms`, and the constrained policy predicts per-index latency, memory, and recall before applying the deployment objective
 
-`make plot` generates three views that separate those ideas:
+`make plot` generates objective-aware views such as:
 
-- `latency_vs_recall.png`: raw search-quality tradeoff
-- `build_cost_tradeoff.png`: index-size/build-time tradeoff
-- `constraint_winners.png`: which index wins after applying memory and recall constraints
+- `metric_medians_by_index.png`: raw metric medians for each index type
+- `oracle_index_distribution_by_objective.png`: oracle choices by dataset and objective
+- `strategy_<objective>_objective_by_dataset.png`: oracle/model/baseline metric comparison for each objective
+- `strategy_metric_grid_by_objective.png`: all measured metrics compared across selection objectives
+- `constrained_objective_distribution_grid.png`: model vs FAISS rule choices over recall targets and memory budgets
+- `constrained_objective_<metric>_by_dataset.png`: measured outcomes for the constrained policy and FAISS rule baseline
+
+## Constrained Objective
+
+The constrained policy trains three performance regressors over workload features plus candidate index type:
+
+```text
+dataset, n_fraction, N, d, k, index_type -> mean_latency_ms
+dataset, n_fraction, N, d, k, index_type -> index_size_mb
+dataset, n_fraction, N, d, k, index_type -> recall_at_k
+```
+
+The exact memory budget used for oracle labeling is:
+
+```text
+memory_budget_mb = N * d * sizeof(float32) * memory_budget_ratio
+```
+
+For each workload config and constraint pair, each candidate index is scored with predicted metrics:
+
+```text
+score =
+  predicted_latency_norm
++ memory_penalty_weight * max(0, predicted_memory_mb / memory_budget_mb - 1)
++ recall_penalty_weight * max(0, recall_target - predicted_recall)
+```
+
+Lower score is better. The default penalty weights are both `100.0`, so going over the memory budget or below the recall target is heavily penalized relative to latency differences.
+
+The policy chooses the index with the lowest predicted penalty score. Ties prefer lower memory overrun, lower recall shortfall, lower predicted latency, higher predicted recall, lower predicted memory, then the stable index order. The measured constrained oracle is still used for evaluation.
+
+The default constraint grid comes from `src/config.py`:
+
+```text
+MEMORY_BUDGET_RATIOS = [0.5, 1.0, 1.5, 2.0]
+RECALL_TARGETS = [0.85, 0.90, 0.95, 0.99]
+```
 
 ## Layout
 

@@ -35,26 +35,32 @@ def _lookup_performance(
     return pd.concat([result.reset_index(drop=True), perf_df], axis=1)
 
 
+def mean_metric_for_labels(
+    test_df: pd.DataFrame,
+    benchmarks: pd.DataFrame,
+    labels: list[str],
+    metric: str,
+) -> float:
+    """Mean measured ``metric`` across configs for the given index choice per row."""
+    perf = _lookup_performance(test_df, benchmarks, labels)
+    return float(perf[metric].mean())
+
+
 def mean_latency_for_labels(
     test_df: pd.DataFrame,
     benchmarks: pd.DataFrame,
     labels: list[str],
 ) -> float:
     """Mean measured ``mean_latency_ms`` across configs for the given index choice per row."""
-    perf = _lookup_performance(test_df, benchmarks, labels)
-    return float(perf["mean_latency_ms"].mean())
+    return mean_metric_for_labels(test_df, benchmarks, labels, "mean_latency_ms")
 
 
-def expected_mean_latency_uniform_random(
+def expected_mean_metric_uniform_random(
     test_df: pd.DataFrame,
     benchmarks: pd.DataFrame,
+    metric: str,
 ) -> float:
-    """Expected mean latency if the index is chosen uniformly over ``INDEX_TYPES``.
-
-    For each config, this is the average of measured ``mean_latency_ms`` across
-    the three index types (one value per type; benchmarks repeat the same metric
-    across ``memory_budget_mb`` / ``recall_target``).
-    """
+    """Expected mean ``metric`` if the index is chosen uniformly over ``INDEX_TYPES``."""
     means: list[float] = []
     for _, cfg in test_df.iterrows():
         mask = pd.Series(True, index=benchmarks.index)
@@ -63,13 +69,38 @@ def expected_mean_latency_uniform_random(
         sub = benchmarks[mask]
         if sub.empty:
             continue
-        per_type = sub.groupby("index_type", sort=False)["mean_latency_ms"].first()
+        per_type = sub.groupby("index_type", sort=False)[metric].first()
         if set(per_type.index) != set(INDEX_TYPES):
             continue
         means.append(float(np.mean([float(per_type[t]) for t in INDEX_TYPES])))
     if not means:
         return float("nan")
     return float(np.mean(means))
+
+
+def expected_mean_latency_uniform_random(
+    test_df: pd.DataFrame,
+    benchmarks: pd.DataFrame,
+) -> float:
+    """Expected mean latency if the index is chosen uniformly over ``INDEX_TYPES``."""
+    return expected_mean_metric_uniform_random(test_df, benchmarks, "mean_latency_ms")
+
+
+def random_mean_metric_monte_carlo(
+    test_df: pd.DataFrame,
+    benchmarks: pd.DataFrame,
+    metric: str,
+    n_trials: int,
+    seed: int = RANDOM_SEED,
+) -> tuple[float, float]:
+    """Mean and standard error of the per-trial average ``metric`` (one random draw per config)."""
+    rng = np.random.default_rng(seed)
+    trial_means: list[float] = []
+    for _ in range(n_trials):
+        labels = rng.choice(INDEX_TYPES, size=len(test_df)).tolist()
+        trial_means.append(mean_metric_for_labels(test_df, benchmarks, labels, metric))
+    arr = np.asarray(trial_means, dtype=np.float64)
+    return float(arr.mean()), float(arr.std(ddof=1) / np.sqrt(len(arr)))
 
 
 def random_mean_latency_monte_carlo(
@@ -79,13 +110,7 @@ def random_mean_latency_monte_carlo(
     seed: int = RANDOM_SEED,
 ) -> tuple[float, float]:
     """Mean and standard error of the per-trial average latency (one random draw per config)."""
-    rng = np.random.default_rng(seed)
-    trial_means: list[float] = []
-    for _ in range(n_trials):
-        labels = rng.choice(INDEX_TYPES, size=len(test_df)).tolist()
-        trial_means.append(mean_latency_for_labels(test_df, benchmarks, labels))
-    arr = np.asarray(trial_means, dtype=np.float64)
-    return float(arr.mean()), float(arr.std(ddof=1) / np.sqrt(len(arr)))
+    return random_mean_metric_monte_carlo(test_df, benchmarks, "mean_latency_ms", n_trials, seed)
 
 
 def always_hnsw(
@@ -105,23 +130,34 @@ def random_baseline(
     labels = rng.choice(INDEX_TYPES, size=len(test_df)).tolist()
     return _lookup_performance(test_df, benchmarks, labels)
 
-def faiss_rule_based(
-    test_df: pd.DataFrame, benchmarks: pd.DataFrame
-) -> pd.DataFrame:
-    """Apply FAISS-style heuristic to each config, look up measured performance.
 
-    Rules (applied in order):
-    1. If raw vectors exceed memory budget (N * d * 4 bytes > budget), use IVF_PQ.
-    2. If recall_target >= 0.95, use HNSW.
-    3. Otherwise use IVF_FLAT.
-    """
+def faiss_rule_based_labels(test_df: pd.DataFrame) -> list[str]:
+    """Return labels from a simple FAISS-style heuristic."""
     labels: list[str] = []
     for _, row in test_df.iterrows():
+        memory_budget_mb = row.get("memory_budget_mb")
+        recall_target = row.get("recall_target")
         raw_mb = float(row["N"]) * float(row["d"]) * 4.0 / (1024 ** 2)
-        if raw_mb > float(row["memory_budget_mb"]):
+
+        if pd.notna(memory_budget_mb) and raw_mb > float(memory_budget_mb):
             labels.append("IVF_PQ")
-        elif float(row["recall_target"]) >= 0.95:
+        elif pd.notna(recall_target) and float(recall_target) >= 0.95:
             labels.append("HNSW")
         else:
             labels.append("IVF_FLAT")
+
+    return labels
+
+
+def faiss_rule_based(
+    test_df: pd.DataFrame,
+    benchmarks: pd.DataFrame,
+) -> pd.DataFrame:
+    """Apply a simple FAISS-style heuristic and look up measured performance.
+
+    If memory_budget_mb is present and raw vectors exceed it, choose IVF_PQ.
+    If recall_target is present and high, choose HNSW. Otherwise choose IVF_FLAT.
+    """
+    labels = faiss_rule_based_labels(test_df)
     return _lookup_performance(test_df, benchmarks, labels)
+

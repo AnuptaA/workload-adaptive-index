@@ -1,8 +1,7 @@
-import numpy as np
 import pandas as pd
 import pytest
 
-from src.baselines import faiss_rule_based, mean_latency_for_labels
+from src.baselines import faiss_rule_based_labels, mean_latency_for_labels
 from src.labeling import CONFIG_COLS
 
 
@@ -19,8 +18,6 @@ def _make_benchmarks() -> pd.DataFrame:
             "N": 50000,
             "d": 128,
             "k": 10,
-            "memory_budget_mb": 256,
-            "recall_target": 0.90,
             "index_type": index_type,
             "mean_latency_ms": lat,
             "p99_latency_ms": lat * 2,
@@ -29,19 +26,6 @@ def _make_benchmarks() -> pd.DataFrame:
             "build_time_s": 1.0,
         })
     return pd.DataFrame(rows)
-
-
-def _make_test_config(memory_budget_mb: float, recall_target: float, N: int = 50000) -> pd.DataFrame:
-    return pd.DataFrame([{
-        "dataset": "sift-1M",
-        "n_fraction": 0.05,
-        "N": N,
-        "d": 128,
-        "k": 10,
-        "memory_budget_mb": memory_budget_mb,
-        "recall_target": recall_target,
-        "label": "HNSW",
-    }])
 
 
 class TestMeanLatencyForLabels:
@@ -67,32 +51,54 @@ class TestMeanLatencyForLabels:
             "N": 99,
             "d": 128,
             "k": 10,
-            "memory_budget_mb": 256,
-            "recall_target": 0.90,
         }])
         mean_latency_for_labels(bad_config, benchmarks, ["HNSW"])
         captured = capsys.readouterr()
         assert "Warning" in captured.out
 
 
-class TestFaissRuleBased:
-    def test_tight_memory_gives_ivf_pq(self):
-        benchmarks = _make_benchmarks()
-        # N=50000, d=128 → raw_mb = 50000*128*4/1e6 = 25.6 MB; budget=20 → raw > budget
-        test_df = _make_test_config(memory_budget_mb=20, recall_target=0.90)
-        result = faiss_rule_based(test_df, benchmarks)
-        assert result["predicted_index"].iloc[0] == "IVF_PQ"
+class TestFaissRuleBasedLabels:
+    def test_defaults_to_ivf_flat_without_constraints(self):
+        config = pd.DataFrame([{
+            "dataset": "sift-1M",
+            "n_fraction": 0.05,
+            "N": 50000,
+            "d": 128,
+            "k": 10,
+        }])
+        assert faiss_rule_based_labels(config) == ["IVF_FLAT"]
 
-    def test_high_recall_gives_hnsw(self):
-        benchmarks = _make_benchmarks()
-        # raw_mb = 25.6 < budget=512, recall_target=0.99 >= 0.95
-        test_df = _make_test_config(memory_budget_mb=512, recall_target=0.99)
-        result = faiss_rule_based(test_df, benchmarks)
-        assert result["predicted_index"].iloc[0] == "HNSW"
+    def test_tight_memory_uses_ivf_pq(self):
+        config = pd.DataFrame([{
+            "dataset": "sift-1M",
+            "n_fraction": 0.05,
+            "N": 50000,
+            "d": 128,
+            "k": 10,
+            "memory_budget_mb": 1.0,
+        }])
+        assert faiss_rule_based_labels(config) == ["IVF_PQ"]
 
-    def test_default_gives_ivf_flat(self):
-        benchmarks = _make_benchmarks()
-        # raw_mb = 25.6 < budget=512, recall_target=0.90 < 0.95
-        test_df = _make_test_config(memory_budget_mb=512, recall_target=0.90)
-        result = faiss_rule_based(test_df, benchmarks)
-        assert result["predicted_index"].iloc[0] == "IVF_FLAT"
+    def test_high_recall_target_uses_hnsw(self):
+        config = pd.DataFrame([{
+            "dataset": "sift-1M",
+            "n_fraction": 0.05,
+            "N": 50000,
+            "d": 128,
+            "k": 10,
+            "memory_budget_mb": 1000.0,
+            "recall_target": 0.99,
+        }])
+        assert faiss_rule_based_labels(config) == ["HNSW"]
+
+    def test_memory_budget_takes_precedence_over_recall_target(self):
+        config = pd.DataFrame([{
+            "dataset": "sift-1M",
+            "n_fraction": 0.05,
+            "N": 50000,
+            "d": 128,
+            "k": 10,
+            "memory_budget_mb": 1.0,
+            "recall_target": 0.99,
+        }])
+        assert faiss_rule_based_labels(config) == ["IVF_PQ"]
